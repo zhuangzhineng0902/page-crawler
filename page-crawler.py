@@ -1,184 +1,157 @@
 import os
 import re
+import json
 import time
 import base64
 import requests
-from bs4 import BeautifulSoup, Tag, NavigableString, Comment
+from bs4 import BeautifulSoup, NavigableString, Comment
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from openai import OpenAI
 
 # ================= 配置区 =================
-# OpenAI 客户端配置
-API_KEY = "your-api-key"
-CUSTOM_BASE_URL = "https://your-proxy-domain.com/v1" # 自定义 URL
-
-# 网页选择器配置
-BASE_URL = 'https://docs.example.com'
+CONFIG_FILE = "menu.json"           # JSON 配置文件
+BASE_URL = "https://docs.example.com" # 基础 URL
 LOGIN_URL = f"{BASE_URL}/login"
-MENU_SELECTOR = 'aside.sidebar nav'     # 菜单选择器
-CONTENT_SELECTOR = 'main.content-body'  # 正文选择器
-OUTPUT_DIR = "markdown_docs"
+CONTENT_SELECTOR = "main.content-body" # 页面正文选择器
+OUTPUT_DIR = "scraped_docs"
 
-# 初始化 OpenAI 客户端
-client = OpenAI(
-    api_key=API_KEY,
-    base_url=CUSTOM_BASE_URL
-)
+# OpenAI 配置
+API_KEY = "your-api-key"
+CUSTOM_BASE_URL = "https://your-proxy-domain.com/v1"
 
-class WebToMarkdownParser:
-    def __init__(self, session):
-        self.session = session # 共享爬虫的 Session 以保持登录状态
+client = OpenAI(api_key=API_KEY, base_url=CUSTOM_BASE_URL)
 
-    def encode_image_to_base64(self, img_url):
-        """下载图片并转换为 Base64 文件流"""
+class DocScraper:
+    def __init__(self):
+        self.output_path = OUTPUT_DIR
+        if not os.path.exists(self.output_path):
+            os.makedirs(self.output_path)
+        
+        # 初始化浏览器
+        self.driver = webdriver.Chrome()
+        self.session = requests.Session()
+
+    def sync_cookies(self):
+        """将 Selenium 的登录态同步到 requests"""
+        for cookie in self.driver.get_cookies():
+            self.session.cookies.set(cookie['name'], cookie['value'])
+
+    def get_image_base64(self, img_url):
+        """下载图片并转为 Base64 流"""
         try:
-            # 补全相对路径
             full_url = requests.compat.urljoin(BASE_URL, img_url)
-            # 使用带 Cookie 的 session 下载图片
-            response = self.session.get(full_url, timeout=10)
-            if response.status_code == 200:
-                # 获取图片后缀名（简单处理）
+            # 使用带登录态的 session 下载
+            resp = self.session.get(full_url, timeout=10)
+            if resp.status_code == 200:
                 ext = img_url.split('.')[-1].lower()
-                mime_type = f"image/{ext}" if ext in ['png', 'jpg', 'jpeg', 'gif', 'webp'] else "image/jpeg"
-                base64_data = base64.b64encode(response.content).decode('utf-8')
-                return f"data:{mime_type};base64,{base64_data}"
+                mime = f"image/{ext}" if ext in ['png','jpg','jpeg','gif'] else "image/jpeg"
+                b64 = base64.b64encode(resp.content).decode('utf-8')
+                return f"data:{mime};base64,{b64}"
         except Exception as e:
-            print(f"图片下载失败: {e}")
+            print(f"  [!] 图片获取失败: {e}")
         return None
 
-    def parse_image_with_ai(self, img_url):
-        """将图片文件流发送给大模型"""
-        base64_image = self.encode_image_to_base64(img_url)
-        if not base64_image:
-            return "[图片解析失败：无法获取图片文件流]"
-
+    def analyze_img_with_ai(self, img_url):
+        """多模态解析图片"""
+        b64_data = self.get_image_base64(img_url)
+        if not b64_data: return "[无法读取图片]"
         try:
-            response = client.chat.completions.create(
+            res = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "请描述这张图片的内容，并提取其中的关键文字。"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": base64_image} # 这里传入的是 base64 数据流
-                        }
-                    ]
-                }],
-                max_tokens=300
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": "描述图片内容并提取其中文字。"},
+                    {"type": "image_url", "image_url": {"url": b64_data}}
+                ]}]
             )
-            return response.choices[0].message.content.strip()
+            return res.choices[0].message.content.strip()
         except Exception as e:
             return f"[AI解析报错: {e}]"
 
-    def handle_element(self, element):
-        """递归处理 HTML 到 Markdown 的映射 (基于 beautifulsoup4)"""
+    def html_to_md(self, element):
+        """递归将 BS4 元素转换为 Markdown"""
         if isinstance(element, Comment): return ""
-        if isinstance(element, NavigableString):
-            return element.string if element.string else ""
-
-        # 递归获取子节点内容
-        child_content = "".join(self.handle_element(child) for child in element.children)
+        if isinstance(element, NavigableString): return element.string or ""
 
         tag = element.name
-        # 完整的标签映射矩阵
+        # 预先处理子节点内容
+        inner_md = "".join(self.html_to_md(c) for c in element.children)
+
         match tag:
-            case 'h1': return f"\n# {child_content}\n"
-            case 'h2': return f"\n## {child_content}\n"
-            case 'h3': return f"\n### {child_content}\n"
-            case 'p': return f"\n{child_content}\n"
-            case 'strong' | 'b': return f"**{child_content}**"
-            case 'em' | 'i': return f"*{child_content}*"
-            case 'a': return f"[{child_content}]({element.get('href', '#')})"
+            case 'h1' | 'h2' | 'h3': return f"\n{'#' * int(tag[1])} {inner_md}\n"
+            case 'p': return f"\n{inner_md}\n"
+            case 'strong' | 'b': return f"**{inner_md}**"
+            case 'em' | 'i': return f"*{inner_md}*"
+            case 'a': return f"[{inner_md}]({element.get('href', '#')})"
+            case 'ul' | 'ol': return f"\n{inner_md}\n"
             case 'li':
                 prefix = "1. " if element.parent.name == 'ol' else "* "
-                return f"{prefix}{child_content}\n"
-            case 'ul' | 'ol': return f"\n{child_content}\n"
-            case 'blockquote': return f"\n> {child_content.replace('\n', '\n> ')}\n"
-            case 'pre': return f"\n```\n{child_content.strip()}\n```\n"
-            case 'code':
-                return f"`{child_content}`" if element.parent.name != 'pre' else child_content
+                return f"{prefix}{inner_md}\n"
+            case 'pre': return f"\n```\n{element.get_text().strip()}\n```\n"
             case 'img':
                 src = element.get('src', '')
-                ai_desc = self.parse_image_with_ai(src)
-                return f"\n\n![image]({src})\n> **AI 图片内容解析**: {ai_desc}\n\n"
-            case 'table': return self.convert_table(element)
-            case 'hr': return "\n---\n"
-            case 'br': return "\n"
-            case _: return child_content
+                desc = self.analyze_img_with_ai(src)
+                return f"\n![img]({src})\n> **AI解析**: {desc}\n"
+            case 'table': return self._parse_table(element)
+            case _: return inner_md
 
-    def convert_table(self, table):
-        """表格转换"""
+    def _parse_table(self, table):
         rows = []
         for tr in table.find_all('tr'):
             cells = [td.get_text(strip=True) for td in tr.find_all(['td', 'th'])]
             rows.append(f"| {' | '.join(cells)} |")
         if not rows: return ""
-        sep = f"| {' | '.join(['---'] * len(table.find('tr').find_all(['td', 'th'])))} |"
+        sep = f"| {' | '.join(['---']*len(table.find('tr').find_all(['td','th'])))} |"
         rows.insert(1, sep)
         return "\n" + "\n".join(rows) + "\n"
 
-def main():
-    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
-    
-    # 1. 启动 Selenium 
-    driver = webdriver.Chrome()
-    driver.get(LOGIN_URL)
-    input(">>> 请在浏览器中完成登录，完成后回到终端按回车...")
-
-    # 2. 将 Selenium 的 Cookie 同步给 Requests (用于下载图片)
-    session = requests.Session()
-    for cookie in driver.get_cookies():
-        session.cookies.set(cookie['name'], cookie['value'])
-    
-    parser = WebToMarkdownParser(session)
-
-    # 3. 抓取菜单树
-    soup = BeautifulSoup(driver.page_source, 'lxml')
-    menu_nav = soup.select_one(MENU_SELECTOR)
-    
-    tasks = []
-    def traverse_menu(root, current_path=[]):
-        for li in root.find_all('li', recursive=False):
-            a = li.find('a', recursive=False)
-            if not a: continue
+    def process_menu_tree(self, nodes, current_path=[]):
+        """递归遍历 JSON 菜单树"""
+        for node in nodes:
+            label = re.sub(r'[\\/:*?"<>|]', '-', node.get('label', 'unnamed'))
+            new_path = current_path + [label]
             
-            # 清理文件名非法字符
-            title = re.sub(r'[\\/:*?"<>|]', '-', a.get_text(strip=True))
-            new_path = current_path + [title]
-            url = a.get('href')
-            
-            if url and not url.startswith('#') and 'javascript' not in url:
-                tasks.append({'path': new_path, 'url': requests.compat.urljoin(BASE_URL, url)})
-            
-            sub_ul = li.find('ul')
-            if sub_ul: traverse_menu(sub_ul, new_path)
+            # 判断是否有子节点
+            children = node.get('children', [])
+            if children:
+                # 递归子节点
+                self.process_menu_tree(children, new_path)
+            else:
+                # 叶子节点，拼接 URL 并爬取
+                target_url = f"{BASE_URL}/{node['belongToSysId']}/{node['id']}"
+                self.scrape_page(target_url, new_path)
 
-    if menu_nav:
-        traverse_menu(menu_nav)
-    else:
-        print("未定位到菜单，请检查 MENU_SELECTOR"); return
+    def scrape_page(self, url, path_list):
+        file_name = "-".join(path_list) + ".md"
+        print(f">>> 正在同步: {file_name} (URL: {url})")
+        
+        self.driver.get(url)
+        time.sleep(2) # 等待页面加载
+        
+        soup = BeautifulSoup(self.driver.page_source, 'lxml')
+        content = soup.select_one(CONTENT_SELECTOR)
+        
+        if content:
+            md_body = self.html_to_md(content)
+            save_path = os.path.join(self.output_path, file_name)
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(f"# {' / '.join(path_list)}\n\n{md_body}")
 
-    # 4. 遍历并生成 Markdown
-    for task in tasks:
-        file_name = "-".join(task['path']) + ".md"
-        print(f">>> 正在同步: {file_name}")
-        
-        driver.get(task['url'])
-        time.sleep(2) # 页面加载等待
-        
-        page_soup = BeautifulSoup(driver.page_source, 'lxml')
-        content_element = page_soup.select_one(CONTENT_SELECTOR)
-        
-        if content_element:
-            markdown_content = parser.handle_element(content_element)
-            with open(os.path.join(OUTPUT_DIR, file_name), "w", encoding="utf-8") as f:
-                f.write(f"# {' / '.join(task['path'])}\n\n")
-                f.write(markdown_content)
+    def run(self):
+        # 1. 加载配置
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            menu_data = json.load(f)
 
-    driver.quit()
-    print(">>> 任务完成！")
+        # 2. 登录并同步 Cookie
+        self.driver.get(LOGIN_URL)
+        input(">>> 请在浏览器登录完成后，回到此处按回车...")
+        self.sync_cookies()
+
+        # 3. 开始递归处理
+        self.process_menu_tree(menu_data)
+        
+        self.driver.quit()
+        print(">>> 任务全部完成！")
 
 if __name__ == "__main__":
-    main()
+    DocScraper().run()
