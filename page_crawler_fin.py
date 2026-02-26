@@ -141,7 +141,20 @@ class DocScraper:
         try:
             self.driver.get(url)
             time.sleep(2) # 等待页面渲染
-            
+            # --- 新增：使用 JavaScript 移除所有不可见元素 ---
+            # 这段脚本会遍历正文容器内的所有子元素，发现 display 为 none 的直接从 DOM 中删掉
+            self.driver.execute_script(f"""
+                var container = document.querySelector('{CONTENT_SELECTOR}');
+                if (container) {{
+                    var allElements = container.querySelectorAll('*');
+                    allElements.forEach(el => {{
+                        var style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || el.offsetParent === null) {{
+                            el.remove();
+                        }}
+                    }});
+                }}
+            """)
             soup = BeautifulSoup(self.driver.page_source, 'lxml')
             content = soup.select_one(CONTENT_SELECTOR)
             
