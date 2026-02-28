@@ -75,30 +75,61 @@ class DocScraper:
             return f"[AI解析报错: {e}]"
 
     def html_to_md(self, element):
-        """HTML 到 Markdown 转换"""
+        """增强版 HTML 到 Markdown 转换逻辑"""
         if isinstance(element, Comment): return ""
         if isinstance(element, NavigableString): return element.string or ""
 
         tag = element.name
+        
+        # 1. 递归处理子节点
+        # 注意：对于 pre 标签，我们通常直接取 text 以保持格式，不再递归映射标签
+        if tag == 'pre':
+            code_content = element.get_text().strip()
+            return f"\n```\n{code_content}\n```\n"
+
         inner_md = "".join(self.html_to_md(c) for c in element.children)
 
+        # 2. 标签映射矩阵
         match tag:
-            case 'h1' | 'h2' | 'h3': return f"\n\n{'#' * int(tag[1])} {inner_md}\n"
-            case 'p': return f"\n\n{inner_md}\n"
-            case 'strong' | 'b': return f" **{inner_md}** "
-            case 'a': return f" [{inner_md}]({element.get('href', '#')}) "
-            case 'ul' | 'ol': return f"\n{inner_md}\n"
+            case 'h1' | 'h2' | 'h3' | 'h4' | 'h5':
+                level = tag[1]
+                return f"\n\n{'#' * int(level)} {inner_md.strip()}\n"
+            case 'p':
+                return f"\n\n{inner_md.strip()}\n"
+            case 'br':
+                return "  \n" # Markdown 换行标准：双空格+换行
+            case 'hr':
+                return "\n\n---\n\n"
+            case 'strong' | 'b':
+                return f" **{inner_md}** "
+            case 'em' | 'i':
+                return f" *{inner_md}* "
+            case 'del' | 's':
+                return f" ~~{inner_md}~~ "
+            case 'code':
+                # 如果 code 在 pre 之外，则是行内代码
+                return f" `{inner_md}` "
+            case 'a':
+                href = element.get('href', '#')
+                return f" [{inner_md}]({href}) "
+            case 'ul' | 'ol':
+                return f"\n{inner_md}\n"
             case 'li':
-                prefix = "1. " if element.parent.name == 'ol' else "* "
-                return f"{prefix}{inner_md}\n"
-            case 'pre': return f"\n```\n{element.get_text().strip()}\n```\n"
+                prefix = "1. " if element.parent and element.parent.name == 'ol' else "* "
+                return f"{prefix}{inner_md.strip()}\n"
+            case 'blockquote':
+                return f"\n> {inner_md.strip().replace('\n', '\n> ')}\n"
             case 'img':
                 src = element.get('src', '').strip()
                 desc = self.analyze_img_with_ai(src)
                 if desc is None: return ""
                 return f"\n\n![img]({src})\n> **AI解析**: {desc}\n\n"
-            case 'table': return self._parse_table(element)
-            case _: return inner_md
+            case 'table':
+                return self._parse_table(element)
+            case 'div' | 'section' | 'article' | 'span':
+                return inner_md # 容器标签透传内容
+            case _:
+                return inner_md
 
     def _parse_table(self, table):
         rows = []
